@@ -89,7 +89,8 @@ def write_results_tsv(path: Path, header: list[str], rows: list[dict[str, str]])
         writer = csv.DictWriter(f, fieldnames=header, delimiter="\t")
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            clean = {k: v for k, v in row.items() if k is not None}
+            writer.writerow({k: clean.get(k, "") for k in header})
 
 
 def build_prompt_for_local_codex(summary: dict[str, Any]) -> str:

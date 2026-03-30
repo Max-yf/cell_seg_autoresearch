@@ -85,7 +85,48 @@ RESULTS_HEADER = [
     "notes",
 ]
 
+def migrate_results_file_if_needed(path: Path) -> None:
+    """
+    Upgrade an existing legacy results.tsv (without campaign_name column)
+    to the current header schema.
 
+    Safe behavior:
+    - If file does not exist / is empty: do nothing
+    - If header already contains campaign_name: do nothing
+    - Otherwise rewrite the whole file with campaign_name inserted after timestamp_end
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return
+
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        old_header = reader.fieldnames or []
+        rows = list(reader)
+
+    if "campaign_name" in old_header:
+        return
+
+    if "timestamp_end" not in old_header:
+        raise RuntimeError(
+            f"Legacy results.tsv has unexpected header, cannot migrate safely: {old_header}"
+        )
+
+    insert_idx = old_header.index("timestamp_end") + 1
+    new_header = old_header[:insert_idx] + ["campaign_name"] + old_header[insert_idx:]
+
+    migrated_rows = []
+    for row in rows:
+        clean = {k: v for k, v in row.items() if k is not None}
+        trial_root = clean.get("trial_root", "") or ""
+        clean["campaign_name"] = detect_campaign_name_from_trial_root(trial_root)
+        migrated_rows.append(clean)
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=new_header, delimiter="\t")
+        writer.writeheader()
+        for row in migrated_rows:
+            writer.writerow({k: row.get(k, "") for k in new_header})
+            
 # -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
