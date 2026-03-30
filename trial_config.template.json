@@ -1,0 +1,45 @@
+{
+    "schema_version": "1.0",
+    "config_type": "trial",
+    "trial_id": "trial_0001",
+    "parent_config": "./baseline_config.json",
+    "run_tag": "linked_search_v1",
+    "description": "Modify Step2 radius/bias and Step3 cp/rescale only.",
+  
+    "inherit_from_parent": true,
+  
+    "search_edit_summary": {
+      "step1_changed": false,
+      "step2_changed": true,
+      "step3_changed": true,
+      "changed_keys": [
+        "step2_local_normalization.radius",
+        "step2_local_normalization.bias",
+        "step3_cellpose_3d.cellprob_threshold",
+        "step3_cellpose_3d.rescale"
+      ],
+      "hypothesis": "Slightly larger local normalization window plus adjusted Step3 threshold may increase count while controlling hollow artifacts."
+    },
+  
+    "overrides": {
+      "step2_local_normalization": {
+        "radius": 40,
+        "bias": 0.0008
+      },
+      "step3_cellpose_3d": {
+        "cellprob_threshold": 0.5,
+        "rescale": 1.1
+      }
+    },
+  
+    "expected_risk": {
+      "oom_risk": "low",
+      "artifact_risk": "medium",
+      "runtime_risk": "low"
+    },
+  
+    "evaluation_request": {
+      "level": "crop",
+      "crop_ids": ["crop_zhigh_xy0", "crop_zmid_xy1", "crop_zdiff_xy0"]
+    }
+  }

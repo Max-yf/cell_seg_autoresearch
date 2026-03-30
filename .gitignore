@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs and scheduler artifacts
+*.log
+*.out
+*.err
+slurm-*.out
+slurm-*.err
+
+# Heavy artifacts
+*.tif
+*.tiff
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# Temp
+tmp/
+scratch/
+
+# Keep lightweight experiment records, ignore heavy run outputs only
+runs/*/crops/
+runs/*/logs/
+runs/*/step12_output/
+runs/*/step3_output/
+# Ignore experiment outputs and local ledgers
+runs/
+results.tsv
+results.tsv.lock

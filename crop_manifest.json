@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "source_image": {
+    "input_path": "/gpfs/share/home/2306391536/projects/cell_seg/fish7/data/complete_raw/fish7 double 3d_C1.tif",
+    "shape_zyx": [200, 1024, 1024]
+  },
+  "crops": [
+    {
+      "crop_id": "crop_dense_center_001",
+      "role": "smoke_test",
+      "z_range": [109, 141],
+      "y_range": [560, 816],
+      "x_range": [384, 640]
+    }
+  ]
+}

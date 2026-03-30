@@ -1,0 +1,112 @@
+{
+    "schema_version": "1.0",
+    "config_type": "baseline",
+    "run_tag": "baseline_v1",
+    "description": "Stable baseline for linked Step1+Step2+Step3 crop evaluation and later full-volume verification.",
+  
+    "input": {
+      "input_path": "/gpfs/share/home/2306391536/projects/cell_seg/fish7/data/complete_raw/fish7 double 3d_C1.tif",
+      "input_type": "single_3d_tiff",
+      "expected_suffix": [".tif", ".tiff"],
+      "expected_axis_order": "ZYX",
+      "expected_ndim": 3,
+      "z_axis": 0
+    },
+  
+    "model": {
+      "model_path": "/gpfs/share/home/2306391536/projects/cell_seg/delivery_nuclei3d_pipeline/model/finetuned_cellpose_sam_model",
+      "config_path": "/gpfs/share/home/2306391536/projects/cell_seg/delivery_nuclei3d_pipeline/model/model_config.json",
+      "model_family": "cellpose-sam",
+      "model_status": "fixed",
+      "notes": "2D finetuned model is fixed and not part of search."
+    },
+  
+    "hard_constraints": {
+      "diameter_must_be_null": true,
+      "require_do_3d": true,
+      "require_z_axis_0": true,
+      "allow_only_single_3d_tiff": true,
+      "forbid_model_change": true
+    },
+  
+    "step1_sparse_sim": {
+      "enabled": true,
+      
+      "pixel_size_nm": 500,
+      "wavelength_nm": 488,
+      "effective_na": 1.0,
+  
+      "sparse_iter": 120,
+      "fidelity": 150.0,
+      "z_continuity": 1.0,
+      "sparsity": 6.0,
+      "deconv_iter": 8,
+  
+      "background_mode": "none",
+      "deblurring_method": "lucy_richardson",
+      "oversampling_method": "none",
+      "psf_integration_samples": 1024,
+  
+      "mode": "windowed_gpu",
+      "window_size": 32,
+      "halo": 4,
+      "backend": "cuda",
+      "gpu_device_index": 0,
+      "notes": "On cluster jobs, gpu_device_index is interpreted relative to the GPUs visible to the current process/job. Default 0 usually means the first allocated visible GPU."
+    },
+  
+    "step2_local_normalization": {
+      "enabled": true,
+      "radius": 30,
+      "bias": 0.0005,
+      "output_dtype": "uint16"
+    },
+  
+    "step3_cellpose_3d": {
+      "enabled": true,
+      "use_gpu": true,
+      "gpu_device_index": 0,
+  
+      "cellprob_threshold": 0.0,
+      "min_size": 50,
+      "anisotropy": 1.0,
+      "diameter": null,
+      "rescale": 1.0,
+      "do_3D": true,
+      "z_axis": 0,
+      "batch_size_3d": 4,
+      "bsize": 256,
+      "stitch_threshold": 0.0,
+      "flow_threshold": 0.4,
+      "tile_overlap": 0.1,
+      "augment": false,
+      "save_flows": false
+    },
+  
+    "crop_evaluation": {
+      "use_crop_manifest": true,
+      "crop_manifest_path": "./crop_manifest.json",
+      "evaluation_level": "crop",
+      "score_across_crops": "mean"
+    },
+  
+    "scoring": {
+      "primary_objective": "maximize_valid_cell_count_and_reduce_hollow_artifacts",
+      "score_formula_version": "v1",
+      "weights": {
+        "cell_count": 1.0,
+        "hollow_penalty": 1.0,
+        "failure_penalty": 1000000.0,
+        "memory_penalty": 0.1,
+        "runtime_penalty": 0.01
+      }
+    },
+  
+    "output": {
+      "root_dir": "./runs",
+      "save_used_config": true,
+      "save_trial_record": true,
+      "save_score_json": true,
+      "save_intermediate_tiffs": false
+    }
+  }
