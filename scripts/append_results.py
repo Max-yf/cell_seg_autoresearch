@@ -19,7 +19,15 @@ Then it:
 3. assigns a simple decision: keep / discard / crash,
 4. appends the row to results.tsv,
 5. optionally writes the decision back into score.json.
+
+Modified in this version
+------------------------
+- add campaign_name column
+- detect campaign_name from trial_root path
+- leave campaign_name empty for non-campaign rows, e.g. baseline rows outside
+  runs/campaign_xxx/
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,6 +41,7 @@ from typing import Any
 RESULTS_HEADER = [
     "timestamp_start",
     "timestamp_end",
+    "campaign_name",
     "run_tag",
     "trial_id",
     "decision",
@@ -87,11 +96,9 @@ def load_json(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
-
 def save_json(path: Path, data: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
 
 
 def safe_float(x: Any) -> float | None:
@@ -106,10 +113,8 @@ def safe_float(x: Any) -> float | None:
         return None
 
 
-
 def compact_json(x: Any) -> str:
     return json.dumps(x, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
 
 
 def ensure_results_file(path: Path) -> None:
@@ -121,14 +126,12 @@ def ensure_results_file(path: Path) -> None:
         writer.writeheader()
 
 
-
 def read_existing_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists() or path.stat().st_size == 0:
         return []
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         return list(reader)
-
 
 
 def best_existing_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
@@ -145,6 +148,22 @@ def best_existing_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
             best_row = row
     return best_row
 
+
+def detect_campaign_name_from_trial_root(trial_root: str | Path) -> str:
+    """
+    Detect campaign name from a path like:
+      .../runs/campaign_001/trials/trial_0002
+
+    If the path does not live under runs/campaign_xxx/, return empty string.
+    This is the intended behavior for baseline rows.
+    """
+    parts = Path(trial_root).parts
+    for i, part in enumerate(parts):
+        if part == "runs" and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if nxt.startswith("campaign_"):
+                return nxt
+    return ""
 
 
 def decide_row(
@@ -192,7 +211,6 @@ def decide_row(
     return "discard", f"Did not beat current best score {best_score:.6f}."
 
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Append one scored trial into results.tsv.")
     parser.add_argument("--trial-root", required=True, help="Path to the trial root directory.")
@@ -208,7 +226,6 @@ def parse_args() -> argparse.Namespace:
         help="Write decision and decision_reason back into score.json after appending.",
     )
     return parser.parse_args()
-
 
 
 def main() -> None:
@@ -239,9 +256,12 @@ def main() -> None:
     materialization = used_cfg.get("materialization", {}) or {}
     search_edit = used_cfg.get("search_edit_summary", {}) or {}
 
+    campaign_name = detect_campaign_name_from_trial_root(trial_root)
+
     row: dict[str, Any] = {
         "timestamp_start": trial_record.get("timestamp_start"),
         "timestamp_end": trial_record.get("timestamp_end"),
+        "campaign_name": campaign_name,
         "run_tag": trial_record.get("run_tag") or used_cfg.get("run_tag"),
         "trial_id": trial_record.get("trial_id") or used_cfg.get("trial_id"),
         "trial_status": score_json.get("status"),
@@ -300,11 +320,13 @@ def main() -> None:
         score_json["decision"] = decision
         score_json["decision_reason"] = decision_reason
         score_json["results_tsv_path"] = str(results_path)
+        score_json["campaign_name"] = campaign_name
         save_json(score_json_path, score_json)
 
     print("=" * 90)
     print("Append results finished")
     print(f"results.tsv      : {results_path}")
+    print(f"campaign_name    : {campaign_name or '<empty>'}")
     print(f"trial_id         : {row['trial_id']}")
     print(f"decision         : {decision}")
     print(f"decision_reason  : {decision_reason}")

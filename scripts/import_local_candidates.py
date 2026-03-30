@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-run_autoresearch_loop.py
 
-Prepare a small batch of autoresearch trials locally for later execution on a
-remote Slurm cluster.
-
-This upgraded version also generates:
-- campaign-level finalize_campaign.sbatch
-- dependency-aware submit_all.sh
-- optional immediate submission via --submit
 """
+import_local_candidates.py
+
+Import a local next_round_upload/ package into a new campaign directory and
+prepare Slurm execution artifacts.
+
+Expected local upload package
+-----------------------------
+next_round_upload/
+├── next_round_plan.json
+├── trial_configs/
+│   ├── *.json
+├── README_UPLOAD.md              # optional
+└── optional_notes/               # optional
+
+This script does NOT invent new candidates.
+It only imports, validates, materializes, and prepares execution artifacts.
+"""
+
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import shlex
-import subprocess
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -30,57 +37,91 @@ from materialize_config import (
     validate_hard_constraints,
     validate_required_sections,
 )
-from propose_trial import (
-    build_hypothesis,
-    choose_search_space,
-    choose_seed_row,
-    compact_json,
-    mutate_seed_config,
-    next_trial_id,
-    read_results_tsv,
-    risk_summary,
-    summarize_changed_sections,
-)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare a local autoresearch batch for later Slurm execution."
+        description="Import local next_round_upload/ into a new campaign."
     )
-    parser.add_argument("--baseline", required=True, help="Path to baseline_config.json")
-    parser.add_argument("--crop-manifest", required=True, help="Path to crop_manifest.json")
-    parser.add_argument("--results", default="results.tsv", help="Path to results.tsv")
-    parser.add_argument("--output-root", default="runs", help="Root directory where campaign artifacts will be written.")
-    parser.add_argument("--campaign-name", default=None, help="Optional campaign directory name.")
-    parser.add_argument("--run-tag", default=None, help="Optional run_tag override for the prepared trial configs.")
-    parser.add_argument("--num-candidates", type=int, default=3, help="How many candidate trials to prepare.")
-    parser.add_argument("--strategy", choices=["local", "random"], default="local", help="Mutation strategy.")
-    parser.add_argument("--n-changes", type=int, default=3, help="How many parameter paths to change per candidate.")
-    parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
-    parser.add_argument("--cluster-repo-root", required=True, help="Absolute repository path on the Slurm cluster.")
-    parser.add_argument("--cluster-python", default="python", help="Python executable for Slurm job.")
-    parser.add_argument("--cluster-step12-script", required=True, help="Path to run_step12_pipeline.py on cluster.")
-    parser.add_argument("--cluster-step3-script", required=True, help="Path to run_infer_3d.py on cluster.")
-    parser.add_argument("--cluster-results-path", default=None, help="Optional explicit results.tsv path on cluster.")
-    parser.add_argument("--cluster-setup-line", action="append", default=[], help="Optional shell line for Slurm script.")
+    parser.add_argument(
+        "--upload-dir",
+        required=True,
+        help="Path to next_round_upload/ directory.",
+    )
+    parser.add_argument(
+        "--baseline",
+        required=True,
+        help="Path to baseline_config.json",
+    )
+    parser.add_argument(
+        "--crop-manifest",
+        required=True,
+        help="Path to crop_manifest.json used by the imported trials.",
+    )
+    parser.add_argument(
+        "--results",
+        default="results.tsv",
+        help="Path to global results.tsv",
+    )
+    parser.add_argument(
+        "--output-root",
+        default="runs",
+        help="Root directory where campaign artifacts will be written.",
+    )
+    parser.add_argument(
+        "--campaign-name",
+        default=None,
+        help="Optional explicit campaign name. If omitted, auto-increment campaign_xxx.",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="Optional run_tag override for all imported trials.",
+    )
+    parser.add_argument(
+        "--cluster-repo-root",
+        required=True,
+        help="Absolute repository path on the Slurm cluster.",
+    )
+    parser.add_argument(
+        "--cluster-python",
+        default="python",
+        help="Python executable to use inside the Slurm job.",
+    )
+    parser.add_argument(
+        "--cluster-step12-script",
+        required=True,
+        help="Path to run_step12_pipeline.py on the cluster.",
+    )
+    parser.add_argument(
+        "--cluster-step3-script",
+        required=True,
+        help="Path to run_infer_3d.py on the cluster.",
+    )
+    parser.add_argument(
+        "--cluster-results-path",
+        default=None,
+        help="Optional explicit cluster results.tsv path. Defaults to <cluster_repo_root>/results.tsv",
+    )
+    parser.add_argument(
+        "--cluster-setup-line",
+        action="append",
+        default=[],
+        help="Optional shell line to include in each Slurm script. Repeat as needed.",
+    )
     parser.add_argument("--slurm-partition", default="gpu", help="Slurm partition.")
     parser.add_argument("--slurm-account", default=None, help="Optional Slurm account.")
     parser.add_argument("--slurm-time", default="04:00:00", help="Slurm wall time.")
     parser.add_argument("--slurm-gpus", type=int, default=1, help="GPUs per job.")
     parser.add_argument("--slurm-cpus-per-task", type=int, default=4, help="CPUs per task.")
     parser.add_argument("--slurm-mem", default="32G", help="Memory request.")
-    parser.add_argument("--submit", action="store_true", help="Immediately run submit_all.sh after preparation.")
     return parser.parse_args()
 
 
-def ensure_crop_manifest_has_crops(path: Path) -> dict[str, Any]:
-    manifest = load_json_file(path)
-    crops = manifest.get("crops", [])
-    if not isinstance(crops, list) or not crops:
-        raise ValueError(f"Crop manifest has no crops: {path}")
-    return manifest
+def shell_quote(path_or_text: str) -> str:
+    return shlex.quote(str(path_or_text))
 
 
 def detect_next_campaign_name(runs_root: Path, prefix: str = "campaign_") -> str:
@@ -97,136 +138,50 @@ def detect_next_campaign_name(runs_root: Path, prefix: str = "campaign_") -> str
     return f"{prefix}{max_num + 1:03d}"
 
 
-def choose_seed_config(
-    baseline_cfg: dict[str, Any],
-    baseline_path: Path,
-    existing_rows: list[dict[str, str]],
-) -> tuple[dict[str, Any], dict[str, Any], str | None]:
-    seed_cfg = copy.deepcopy(baseline_cfg)
-    proposed_from: dict[str, Any] = {
-        "source": "baseline",
-        "baseline_path": str(baseline_path),
-    }
-    parent_trial_id = None
-
-    seed_row = choose_seed_row(existing_rows)
-    if seed_row is None:
-        return seed_cfg, proposed_from, parent_trial_id
-
-    used_config_path = seed_row.get("used_config_path")
-    if not used_config_path:
-        return seed_cfg, proposed_from, parent_trial_id
-
-    seed_path = Path(used_config_path)
-    if not seed_path.is_absolute():
-        seed_path = (REPO_ROOT / seed_path).resolve()
-    if not seed_path.exists():
-        return seed_cfg, proposed_from, parent_trial_id
-
-    seed_cfg = load_json_file(seed_path)
-    parent_trial_id = seed_row.get("trial_id")
-    proposed_from = {
-        "source": "results_best",
-        "used_config_path": str(seed_path),
-        "parent_trial_id": parent_trial_id,
-        "parent_score": seed_row.get("score"),
-    }
-    return seed_cfg, proposed_from, parent_trial_id
+def ensure_crop_manifest_has_crops(path: Path) -> dict[str, Any]:
+    manifest = load_json_file(path)
+    crops = manifest.get("crops", [])
+    if not isinstance(crops, list) or not crops:
+        raise ValueError(f"Crop manifest has no crops: {path}")
+    return manifest
 
 
-def build_trial_config(
-    baseline_cfg: dict[str, Any],
-    baseline_path: Path,
-    existing_rows: list[dict[str, str]],
+def normalize_trial_config(
+    trial_cfg: dict[str, Any],
     *,
-    run_tag: str,
-    strategy: str,
-    n_changes: int,
-    seed: int,
+    baseline_path: Path,
+    run_tag: str | None,
+    fallback_trial_id: str,
 ) -> dict[str, Any]:
-    import random
+    cfg = dict(trial_cfg)
 
-    rng = random.Random(seed)
-    search_space = choose_search_space(baseline_cfg)
-    trial_id = next_trial_id(existing_rows)
-    seed_cfg, proposed_from, parent_trial_id = choose_seed_config(
-        baseline_cfg,
-        baseline_path,
-        existing_rows,
-    )
+    # Preserve user's provided fields when present.
+    cfg.setdefault("schema_version", "1.0")
+    cfg.setdefault("config_type", "trial")
+    cfg.setdefault("inherit_from_parent", True)
+    cfg.setdefault("parent_config", str(baseline_path))
+    cfg.setdefault("trial_id", fallback_trial_id)
+    cfg.setdefault("description", "Imported from local next_round_upload.")
+    cfg.setdefault("evaluation_request", {"level": "crop"})
+    cfg.setdefault("proposed_from", {"source": "local_codex_upload"})
+    cfg.setdefault("search_edit_summary", {
+        "step1_changed": False,
+        "step2_changed": False,
+        "step3_changed": False,
+        "changed_keys": [],
+        "hypothesis": "Imported local candidate trial.",
+    })
+    cfg.setdefault("expected_risk", {})
 
-    mutated_cfg = None
-    changed_paths: list[str] = []
-    for _ in range(12):
-        candidate_cfg, candidate_changed_paths = mutate_seed_config(
-            seed_cfg,
-            search_space,
-            n_changes=n_changes,
-            strategy=strategy,
-            rng=rng,
-        )
-        if candidate_changed_paths:
-            mutated_cfg = candidate_cfg
-            changed_paths = candidate_changed_paths
-            break
-    if mutated_cfg is None:
-        raise RuntimeError("Failed to generate a non-empty mutation set after repeated attempts.")
+    if run_tag is not None:
+        cfg["run_tag"] = run_tag
+    else:
+        cfg.setdefault("run_tag", "linked_search")
 
-    overrides = diff_dict(baseline_cfg, mutated_cfg) or {}
-    step1_changed, step2_changed, step3_changed = summarize_changed_sections(changed_paths)
-
-    return {
-        "schema_version": "1.0",
-        "config_type": "trial",
-        "trial_id": trial_id,
-        "parent_trial_id": parent_trial_id,
-        "parent_config": str(baseline_path),
-        "run_tag": run_tag,
-        "description": f"Prepared locally for Slurm execution using {strategy} search.",
-        "inherit_from_parent": True,
-        "proposed_from": proposed_from,
-        "search_edit_summary": {
-            "step1_changed": step1_changed,
-            "step2_changed": step2_changed,
-            "step3_changed": step3_changed,
-            "changed_keys": changed_paths,
-            "hypothesis": build_hypothesis(changed_paths),
-        },
-        "overrides": overrides,
-        "expected_risk": risk_summary(changed_paths),
-        "evaluation_request": {
-            "level": "crop",
-        },
-        "proposal_debug": {
-            "strategy": strategy,
-            "n_changes": int(n_changes),
-            "random_seed": int(seed),
-            "search_space_keys": sorted(search_space.keys()),
-        },
-    }
+    return cfg
 
 
-def diff_dict(base: Any, new: Any) -> Any:
-    if isinstance(base, dict) and isinstance(new, dict):
-        out: dict[str, Any] = {}
-        for key in new.keys():
-            if key not in base:
-                out[key] = copy.deepcopy(new[key])
-            else:
-                child = diff_dict(base[key], new[key])
-                if child not in ({}, None):
-                    out[key] = child
-        return out
-    if base != new:
-        return copy.deepcopy(new)
-    return None
-
-
-def shell_quote(path_or_text: str) -> str:
-    return shlex.quote(str(path_or_text))
-
-
-def render_slurm_script(
+def render_trial_sbatch(
     *,
     job_name: str,
     cluster_repo_root: str,
@@ -426,57 +381,68 @@ def render_submit_all(
     return "\n".join(lines) + "\n"
 
 
-def maybe_submit(campaign_root: Path) -> None:
-    submit_script = campaign_root / "submit_all.sh"
-    if not submit_script.exists():
-        raise FileNotFoundError(f"submit_all.sh not found: {submit_script}")
-    subprocess.run(["bash", str(submit_script)], check=True, cwd=str(campaign_root))
-
-
 def main() -> None:
     args = parse_args()
+
+    upload_dir = Path(args.upload_dir).expanduser().resolve()
     baseline_path = Path(args.baseline).expanduser().resolve()
     crop_manifest_path = Path(args.crop_manifest).expanduser().resolve()
     results_path = Path(args.results).expanduser().resolve()
     output_root = Path(args.output_root).expanduser().resolve()
 
+    if not upload_dir.exists():
+        raise FileNotFoundError(f"Upload directory not found: {upload_dir}")
+    if not baseline_path.exists():
+        raise FileNotFoundError(f"Baseline config not found: {baseline_path}")
+    if not crop_manifest_path.exists():
+        raise FileNotFoundError(f"Crop manifest not found: {crop_manifest_path}")
+
+    ensure_crop_manifest_has_crops(crop_manifest_path)
+
+    trial_configs_dir = upload_dir / "trial_configs"
+    if not trial_configs_dir.exists():
+        raise FileNotFoundError(f"Missing trial_configs/ directory in upload: {trial_configs_dir}")
+
+    trial_config_files = sorted(trial_configs_dir.glob("*.json"))
+    if not trial_config_files:
+        raise ValueError(f"No *.json files found under {trial_configs_dir}")
+
     try:
         crop_manifest_rel = crop_manifest_path.relative_to(REPO_ROOT)
     except ValueError as exc:
         raise ValueError(
-            f"crop_manifest must live inside the repository so cluster-relative paths stay stable: {crop_manifest_path}"
+            f"crop_manifest must live inside repository for stable cluster-relative paths: {crop_manifest_path}"
         ) from exc
 
-    baseline_cfg = load_json_file(baseline_path)
-    validate_required_sections(baseline_cfg)
-    ensure_crop_manifest_has_crops(crop_manifest_path)
-
-    run_tag = args.run_tag or baseline_cfg.get("run_tag", "autoresearch")
-    campaign_name = args.campaign_name or detect_next_campaign_name(output_root)
-    campaign_root = output_root / campaign_name
+    runs_root = output_root
+    campaign_name = args.campaign_name or detect_next_campaign_name(runs_root)
+    campaign_root = runs_root / campaign_name
     trials_root = campaign_root / "trials"
     slurm_root = campaign_root / "slurm"
+
     campaign_root.mkdir(parents=True, exist_ok=True)
     trials_root.mkdir(parents=True, exist_ok=True)
     slurm_root.mkdir(parents=True, exist_ok=True)
 
-    existing_rows = read_results_tsv(results_path)
+    baseline_cfg = load_json_file(baseline_path)
+    validate_required_sections(baseline_cfg)
+
     cluster_repo_root_posix = PurePosixPath(args.cluster_repo_root)
     cluster_results_path = args.cluster_results_path or str(cluster_repo_root_posix / "results.tsv")
+
     prepared_trials: list[dict[str, Any]] = []
 
-    for idx in range(args.num_candidates):
-        trial_seed = args.seed + idx
-        trial_cfg = build_trial_config(
-            baseline_cfg,
-            baseline_path,
-            existing_rows,
-            run_tag=run_tag,
-            strategy=args.strategy,
-            n_changes=args.n_changes,
-            seed=trial_seed,
+    for idx, cfg_path in enumerate(trial_config_files, start=1):
+        raw_trial_cfg = load_json_file(cfg_path)
+        fallback_trial_id = f"trial_{idx:04d}"
+        trial_cfg = normalize_trial_config(
+            raw_trial_cfg,
+            baseline_path=baseline_path,
+            run_tag=args.run_tag,
+            fallback_trial_id=fallback_trial_id,
         )
-        trial_id = trial_cfg["trial_id"]
+
+        trial_id = str(trial_cfg["trial_id"])
         trial_root = trials_root / trial_id
         slurm_dir = trial_root / "slurm"
         trial_root.mkdir(parents=True, exist_ok=True)
@@ -491,6 +457,7 @@ def main() -> None:
         validate_required_sections(used_cfg)
         validate_hard_constraints(used_cfg)
         validate_config_shape(used_cfg)
+
         used_cfg.setdefault("materialization", {})
         used_cfg["materialization"]["baseline_path"] = str(baseline_path)
         used_cfg["materialization"]["trial_path"] = str(trial_config_path)
@@ -501,7 +468,8 @@ def main() -> None:
 
         trial_root_rel = trial_root.relative_to(REPO_ROOT)
         used_config_rel = used_config_path.relative_to(REPO_ROOT)
-        slurm_script = render_slurm_script(
+
+        slurm_script = render_trial_sbatch(
             job_name=trial_id,
             cluster_repo_root=args.cluster_repo_root,
             cluster_python=args.cluster_python,
@@ -526,7 +494,7 @@ def main() -> None:
             "status": "prepared",
             "prepared_at": datetime.now().isoformat(timespec="seconds"),
             "campaign_name": campaign_name,
-            "run_tag": run_tag,
+            "run_tag": trial_cfg.get("run_tag"),
             "trial_id": trial_id,
             "baseline_path": str(baseline_path),
             "results_path_local": str(results_path),
@@ -551,12 +519,12 @@ def main() -> None:
                 "setup_lines": args.cluster_setup_line,
             },
             "trial_config_summary": {
-                "changed_keys": trial_cfg["search_edit_summary"]["changed_keys"],
-                "hypothesis": trial_cfg["search_edit_summary"]["hypothesis"],
-                "expected_risk": trial_cfg["expected_risk"],
-                "proposal_debug": trial_cfg["proposal_debug"],
-                "proposed_from": trial_cfg["proposed_from"],
+                "changed_keys": (trial_cfg.get("search_edit_summary", {}) or {}).get("changed_keys", []),
+                "hypothesis": (trial_cfg.get("search_edit_summary", {}) or {}).get("hypothesis"),
+                "expected_risk": trial_cfg.get("expected_risk", {}),
+                "proposed_from": trial_cfg.get("proposed_from", {}),
             },
+            "source_upload_trial_config": str(cfg_path),
         }
         save_json(metadata_path, metadata)
 
@@ -568,39 +536,41 @@ def main() -> None:
                 "used_config_path": str(used_config_path),
                 "metadata_path": str(metadata_path),
                 "slurm_script_path": str(slurm_script_path),
-                "changed_keys": trial_cfg["search_edit_summary"]["changed_keys"],
-            }
-        )
-
-        existing_rows.append(
-            {
-                "trial_id": trial_id,
-                "used_config_path": str(used_config_path),
+                "changed_keys": (trial_cfg.get("search_edit_summary", {}) or {}).get("changed_keys", []),
             }
         )
 
     finalize_sbatch_path = slurm_root / f"finalize_{campaign_name}.sbatch"
-    finalize_sbatch_path.write_text(
-        render_finalize_sbatch(
-            campaign_name=campaign_name,
-            cluster_repo_root=args.cluster_repo_root,
-            cluster_python=args.cluster_python,
-            cluster_results_path=cluster_results_path,
-            setup_lines=args.cluster_setup_line,
-            slurm_partition=args.slurm_partition,
-            slurm_account=args.slurm_account,
-            slurm_time=args.slurm_time,
-            slurm_cpus_per_task=max(1, args.slurm_cpus_per_task),
-            slurm_mem=args.slurm_mem,
-        ),
-        encoding="utf-8",
+    finalize_sbatch = render_finalize_sbatch(
+        campaign_name=campaign_name,
+        cluster_repo_root=args.cluster_repo_root,
+        cluster_python=args.cluster_python,
+        cluster_results_path=cluster_results_path,
+        setup_lines=args.cluster_setup_line,
+        slurm_partition=args.slurm_partition,
+        slurm_account=args.slurm_account,
+        slurm_time=args.slurm_time,
+        slurm_cpus_per_task=max(1, args.slurm_cpus_per_task),
+        slurm_mem=args.slurm_mem,
     )
+    finalize_sbatch_path.write_text(finalize_sbatch, encoding="utf-8")
 
     submit_all_path = campaign_root / "submit_all.sh"
     submit_all_path.write_text(
         render_submit_all(prepared_trials=prepared_trials, campaign_name=campaign_name),
         encoding="utf-8",
     )
+
+    upload_manifest = {
+        "schema_version": "1.0",
+        "imported_at": datetime.now().isoformat(timespec="seconds"),
+        "upload_dir": str(upload_dir),
+        "trial_configs_count": len(trial_config_files),
+        "trial_config_files": [str(p) for p in trial_config_files],
+        "next_round_plan_json": str(upload_dir / "next_round_plan.json") if (upload_dir / "next_round_plan.json").exists() else None,
+        "readme_upload_md": str(upload_dir / "README_UPLOAD.md") if (upload_dir / "README_UPLOAD.md").exists() else None,
+    }
+    save_json(campaign_root / "import_manifest.json", upload_manifest)
 
     campaign_manifest = {
         "schema_version": "1.0",
@@ -610,11 +580,11 @@ def main() -> None:
         "baseline_path": str(baseline_path),
         "crop_manifest_path": str(crop_manifest_path),
         "results_path": str(results_path),
-        "run_tag": run_tag,
+        "run_tag": args.run_tag,
         "num_candidates": len(prepared_trials),
-        "strategy": args.strategy,
-        "n_changes": args.n_changes,
-        "base_seed": args.seed,
+        "strategy": "imported_local_candidates",
+        "n_changes": None,
+        "base_seed": None,
         "cluster_execution": {
             "cluster_repo_root": args.cluster_repo_root,
             "cluster_python": args.cluster_python,
@@ -625,25 +595,19 @@ def main() -> None:
         },
         "trials": prepared_trials,
         "finalize_sbatch_path": str(finalize_sbatch_path),
+        "import_manifest_path": str(campaign_root / "import_manifest.json"),
     }
     save_json(campaign_root / "campaign_manifest.json", campaign_manifest)
 
     print("=" * 90)
-    print("Prepared autoresearch campaign for Slurm execution")
-    print(f"campaign_root  : {campaign_root}")
-    print(f"campaign_name  : {campaign_name}")
-    print(f"baseline       : {baseline_path}")
-    print(f"crop_manifest  : {crop_manifest_path}")
-    print(f"results.tsv    : {results_path}")
-    print(f"num_candidates : {len(prepared_trials)}")
-    print(f"submit_all.sh  : {submit_all_path}")
-    print(f"finalize_sbatch: {finalize_sbatch_path}")
-    for trial in prepared_trials:
-        print(f" - {trial['trial_id']}: {compact_json(trial['changed_keys'])}")
+    print("Imported local candidates into new campaign")
+    print(f"upload_dir       : {upload_dir}")
+    print(f"campaign_root    : {campaign_root}")
+    print(f"campaign_name    : {campaign_name}")
+    print(f"num_trials       : {len(prepared_trials)}")
+    print(f"submit_all.sh    : {submit_all_path}")
+    print(f"finalize_sbatch  : {finalize_sbatch_path}")
     print("=" * 90)
-
-    if args.submit:
-        maybe_submit(campaign_root)
 
 
 if __name__ == "__main__":

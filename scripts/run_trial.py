@@ -18,11 +18,13 @@ Workflow
 
 Notes
 -----
-- This first-batch script focuses on robust orchestration and traceability.
+- This script focuses on robust orchestration and traceability.
 - Scoring and TSV appending are intentionally separated into later scripts.
-- It assumes your existing pipeline scripts are already working and only needs
-  the correct script paths.
+- This modified version adds lightweight campaign bookkeeping fields:
+  - campaign_name
+  - parent_trial_id
 """
+
 from __future__ import annotations
 
 import argparse
@@ -44,6 +46,7 @@ import tifffile
 # JSON helpers
 # -----------------------------------------------------------------------------
 
+
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -62,6 +65,7 @@ def now_iso() -> str:
 # -----------------------------------------------------------------------------
 # Command helpers
 # -----------------------------------------------------------------------------
+
 
 def stringify(v: Any) -> str:
     if isinstance(v, bool):
@@ -98,6 +102,7 @@ def run_command(cmd: list[str], cwd: Path | None, stdout_path: Path, stderr_path
 # Safe file helpers
 # -----------------------------------------------------------------------------
 
+
 def safe_copy_file(src: Path, dst: Path) -> bool:
     """
     Copy src -> dst only when they are not the same file.
@@ -121,8 +126,30 @@ def safe_copy_file(src: Path, dst: Path) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# Campaign helpers
+# -----------------------------------------------------------------------------
+
+
+def detect_campaign_name_from_trial_root(trial_root: Path) -> str:
+    """
+    Detect campaign name from a path like:
+      .../runs/campaign_001/trials/trial_0002
+
+    If the path is not under runs/campaign_xxx/, return empty string.
+    """
+    parts = trial_root.resolve().parts
+    for i, part in enumerate(parts):
+        if part == "runs" and i + 1 < len(parts):
+            nxt = parts[i + 1]
+            if nxt.startswith("campaign_"):
+                return nxt
+    return ""
+
+
+# -----------------------------------------------------------------------------
 # TIFF handling and crop extraction
 # -----------------------------------------------------------------------------
+
 
 def load_source_stack(path: Path, channel_index: int | None) -> tuple[np.ndarray, dict[str, Any]]:
     with tifffile.TiffFile(path) as tif:
@@ -173,6 +200,7 @@ def extract_crop(stack: np.ndarray, crop: dict[str, Any]) -> np.ndarray:
 # -----------------------------------------------------------------------------
 # Config translation
 # -----------------------------------------------------------------------------
+
 
 STEP1_KEYS_TO_CONFIG_JSON = [
     "pixel_size_nm",
@@ -236,7 +264,6 @@ def step12_command(
     if bool(input_cfg.get("save_extracted_input", False)):
         cmd.append("--save_extracted_input")
 
-    # Optional explicit overrides supported by run_step12_pipeline.py
     for key, flag in [
         ("mode", "--mode"),
         ("window_size", "--window_size"),
@@ -300,8 +327,6 @@ def step3_command(
         cmd.append("--augment")
     if bool(step3_cfg.get("save_flows", False)):
         cmd.append("--save_flows")
-    # do_3D is store_true with default True in the current delivery script,
-    # so there is no explicit false path. We only pass it when True for clarity.
     if bool(step3_cfg.get("do_3D", True)):
         cmd.append("--do_3D")
     return cmd
@@ -310,6 +335,7 @@ def step3_command(
 # -----------------------------------------------------------------------------
 # Trial selection helpers
 # -----------------------------------------------------------------------------
+
 
 def choose_crop_ids(used_cfg: dict[str, Any], manifest: dict[str, Any], explicit_crop_ids: list[str] | None) -> list[str]:
     if explicit_crop_ids:
@@ -323,6 +349,7 @@ def choose_crop_ids(used_cfg: dict[str, Any], manifest: dict[str, Any], explicit
 # -----------------------------------------------------------------------------
 # Trial execution
 # -----------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one crop-level trial end-to-end.")
@@ -366,6 +393,10 @@ def main() -> None:
     step1_cfg = used_cfg["step1_sparse_sim"]
     step2_cfg = used_cfg["step2_local_normalization"]
     step3_cfg = used_cfg["step3_cellpose_3d"]
+
+    materialization = used_cfg.get("materialization", {}) or {}
+    parent_trial_id = materialization.get("trial_id")
+    campaign_name = detect_campaign_name_from_trial_root(trial_root)
 
     step12_script = Path(args.step12_script or used_cfg.get("pipeline_paths", {}).get("run_step12_script", "")).expanduser()
     step3_script = Path(args.step3_script or used_cfg.get("pipeline_paths", {}).get("run_infer_3d_script", "")).expanduser()
@@ -421,7 +452,6 @@ def main() -> None:
         }
 
         try:
-            # Step 1 + Step 2
             cmd12 = step12_command(
                 python_exe=args.python,
                 step12_script=step12_script,
@@ -457,7 +487,6 @@ def main() -> None:
             if not step3_input_path.exists():
                 raise FileNotFoundError(f"Missing Step3 input for crop {crop_id}: {step3_input_path}")
 
-            # Step 3
             cmd3 = step3_command(
                 python_exe=args.python,
                 step3_script=step3_script,
@@ -534,7 +563,9 @@ def main() -> None:
 
     trial_record = {
         "schema_version": "1.0",
+        "campaign_name": campaign_name,
         "trial_id": used_cfg.get("trial_id"),
+        "parent_trial_id": parent_trial_id,
         "run_tag": used_cfg.get("run_tag"),
         "timestamp_start": trial_start,
         "timestamp_end": trial_end,
@@ -563,16 +594,18 @@ def main() -> None:
     save_json(trial_root / "trial_record.json", trial_record)
     print("=" * 90)
     print("Trial finished")
-    print(f"trial_id          : {used_cfg.get('trial_id')}")
-    print(f"run_tag           : {used_cfg.get('run_tag')}")
-    print(f"trial_root        : {trial_root}")
-    print(f"used_config_path  : {used_config_path}")
-    print(f"used_config_copy  : {used_config_copy_path}")
-    print(f"used_config_copied: {copied_used_config}")
-    print(f"status            : {trial_record['status']}")
-    print(f"success/fail      : {success_count}/{fail_count}")
-    print(f"cell_count_mean   : {aggregate['cell_count_mean']}")
-    print(f"runtime_total     : {aggregate['runtime_total_sec']:.2f}s")
+    print(f"campaign_name      : {campaign_name or '<empty>'}")
+    print(f"trial_id           : {used_cfg.get('trial_id')}")
+    print(f"parent_trial_id    : {parent_trial_id}")
+    print(f"run_tag            : {used_cfg.get('run_tag')}")
+    print(f"trial_root         : {trial_root}")
+    print(f"used_config_path   : {used_config_path}")
+    print(f"used_config_copy   : {used_config_copy_path}")
+    print(f"used_config_copied : {copied_used_config}")
+    print(f"status             : {trial_record['status']}")
+    print(f"success/fail       : {success_count}/{fail_count}")
+    print(f"cell_count_mean    : {aggregate['cell_count_mean']}")
+    print(f"runtime_total      : {aggregate['runtime_total_sec']:.2f}s")
     print("=" * 90)
 
 
